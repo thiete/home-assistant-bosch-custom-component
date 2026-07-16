@@ -100,8 +100,13 @@ class BoschBaseSensor(BoschEntity, SensorEntity):
             return None
 
         def check_name():
-            if data.get(NAME, "") != self._name:
-                self._name = data.get(NAME)
+            # data may omit NAME entirely (many raw sensor endpoints only
+            # return id/value/unit) -- don't blank out the entity's name
+            # when that happens, or HA's friendly_name falls back to the
+            # device name for every entity sharing that device (#562, #543).
+            new_name = data.get(NAME)
+            if new_name and new_name != self._name:
+                self._name = new_name
 
         units = get_units()
 
