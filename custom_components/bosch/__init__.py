@@ -246,7 +246,16 @@ class BoschGatewayEntry:
         # Gateway construction is run in the executor because it builds an
         # SSLContext synchronously (load_default_certs), which HA's event
         # loop blocking-call detector flags if run inline.
-        if self._device_type == EASYCONTROL:
+        #
+        # EASYCONTROL is used for both the classic local HTTP/XMPP setup and
+        # the newer POINTT OAuth2 flow. Only entries created through the
+        # OAuth2 flow have a refresh_token (see config_flow.py's
+        # _easycontrol_create_entry vs configure_gateway) -- device_type
+        # alone can't distinguish them, and routing classic local entries
+        # through Oauth2Gateway breaks heating_circuits (it falls back to
+        # BaseGateway's HC-based property, which builds bare BasicCircuit
+        # objects with no climate support instead of EasyZoneCircuit).
+        if self._device_type == EASYCONTROL and self._refresh_token:
             from bosch_thermostat_client.gateway.oauth2 import Oauth2Gateway
 
             session = async_get_clientsession(self.hass)
