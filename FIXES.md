@@ -238,11 +238,62 @@ after ad-hoc `codesign --sign -`) and was not completed. This is entirely
 outside the HA integration's code — it only matters during initial
 EasyControl device setup, not for ongoing operation.
 
+### Fix 4 — Oauth2Gateway wrongly used for classic local EasyControl entries
+
+**Discovered:** after merging, via a live user's HA log/traceback (CT200,
+classic local HTTP setup, firmware `05.04.00`).
+**File:** [`custom_components/bosch/__init__.py`](custom_components/bosch/__init__.py), `BoschGatewayEntry.async_init`
+**Commit:** `3c6d6f7`
+
+This is a regression the merge itself introduced, not a pre-existing
+upstream bug — worth flagging clearly since it's easy to reintroduce if
+this section of `async_init` gets touched again.
+
+**Symptom:** climate platform setup failed entirely with
+`AttributeError: 'BasicCircuit' object has no attribute 'support_presets'`,
+raised from `climate.py`'s `supported_features` at entity-add time (HA
+evaluates it via `capability_attributes` before the entity's first poll,
+so a crash here means the entity never gets added at all — not disabled,
+not hidden, just absent).
+
+**Root cause:** `async_init` routed *any* `device_type == EASYCONTROL`
+entry through `Oauth2Gateway` (`bosch_thermostat_client/gateway/oauth2.py`).
+But `EASYCONTROL` covers two different setups that both predate and
+postdate this merge:
+- classic local HTTP/XMPP, via `config_flow.py`'s `configure_gateway` —
+  never stores a `REFRESH_TOKEN` in the config entry.
+- the new POINTT OAuth2 flow, via `_easycontrol_create_entry` — always
+  stores one.
+
+`Oauth2Gateway` doesn't override `heating_circuits`; it inherits
+`BaseGateway`'s version (`self._data[HC].circuits`), not
+`EasycontrolGateway`'s override (`self._data[ZN].circuits`). For
+`device_type == EASYCONTROL` and `circuit_type == HC`,
+`Circuits.create_circuit` builds a bare `BasicCircuit` — no
+`support_presets`, no `_op_mode`, no climate behavior at all — instead of
+the `EasyZoneCircuit` a zone would get. So any pre-existing classic-flow
+EasyControl entry got silently routed into `Oauth2Gateway`'s codepath and
+handed a `BasicCircuit` where a working zone climate entity used to be.
+
+**Fix:** gate on `self._refresh_token` too — `if self._device_type ==
+EASYCONTROL and self._refresh_token:`. Classic entries (no refresh_token)
+fall through to the `else` branch → `bosch.gateway_chooser` →
+`EasycontrolGateway`, restoring the working `EasyZoneCircuit` path.
+
+**Verification status:** confirmed against the user's actual traceback
+(exact exception type and message match), and independently reproduced
+both ways using the real `bosch_thermostat_client` fork the user is
+running (`Cerbrus/bosch-thermostat-client-python@fix/easycontrol-model-detection`)
+against data shaped like their debug scan: `EasycontrolGateway`'s zone
+path (`EasyZoneCircuit`) evaluates `support_presets` cleanly; a `HC`
+circuit under `EASYCONTROL` reliably produces the same bare `BasicCircuit`
+with no `support_presets`, matching the crash exactly.
+
 ## Combined branch (`working/all-fixes`)
 
 Merge order: `master` → `fix/blocking-gateway-init` → `fix/entity-has-name`
-→ `cerbrus-fork/master`. One manual conflict (described above), otherwise
-clean.
+→ `cerbrus-fork/master` → Fix 4 (above). One manual conflict during the
+`cerbrus-fork/master` merge (described above), otherwise clean.
 
 ### Version bump
 `manifest.json` version bumped `0.28.2` → `0.29.0` (commit `b9fdadd`).
