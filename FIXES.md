@@ -350,11 +350,62 @@ a fresh OAuth login, the next place to look is whether
 through `token_expires_at` (stored as an ISO string, reparsed with
 `datetime.fromisoformat` on load).
 
+### Fix 6 — Oauth2Gateway doesn't override heating_circuits for zones
+
+**Discovered:** by the same live user, after Fix 4 and Fix 5 got them a
+genuinely working OAuth2 connection — the *same* `AttributeError:
+'BasicCircuit' object has no attribute 'support_presets'` crash from Fix
+4 recurred, but now via `bosch_thermostat_client.gateway.**oauth2**`
+instead of `.easycontrol` in the log. Fix 4 correctly routed this user
+to `Oauth2Gateway` (they're a genuine POINTT OAuth2 user, not a
+misrouted classic one) — this is a bug *inside* that legitimate path,
+not a routing problem.
+**File:** [`custom_components/bosch/climate.py`](custom_components/bosch/climate.py), `async_setup_entry`
+**Commit:** `6d7b81b`
+
+**Root cause:** `EasycontrolGateway` overrides `heating_circuits` to
+return `self._data[ZN].circuits` (zones) for `EASYCONTROL`, instead of
+`BaseGateway`'s default `self._data[HC].circuits` (heating circuits).
+`Oauth2Gateway` never got the equivalent override — it inherits
+`BaseGateway.heating_circuits` unconditionally, so even when
+`device_type == EASYCONTROL`, it hands `climate.py` `HC`-type
+`BasicCircuit` objects (bare, no climate behavior at all) instead of the
+`ZN`-type `EasyZoneCircuit` a zone should be.
+
+The zone data itself is unaffected by this: `get_capabilities()` (also
+inherited from `BaseGateway`, and `Oauth2Gateway.initialize_circuits`
+delegates to it via `super()` for any non-`AC` circuit type) still
+correctly populates `self._data[ZN]` with real `EasyZoneCircuit`
+objects regardless of gateway class, since circuit construction is
+driven by `circuit_type`/`device_type` on the shared `Circuits` class,
+not by which gateway subclass initiated it. Only the `heating_circuits`
+*property* pointed at the wrong dict key.
+
+**Fix:** `climate.py` now asks for `ZN` circuits directly via
+`gateway.get_circuits(ZN)` (a generic, non-overridden accessor common to
+all gateway classes) whenever `gateway.device_type == EASYCONTROL`,
+instead of relying on `heating_circuits`. This works identically for
+`EasycontrolGateway` (whose own `heating_circuits` override already just
+returns the same `self._data[ZN].circuits`) and fixes `Oauth2Gateway`
+without touching the client library fork at all — entirely contained in
+this repo.
+
+**Verification status:** confirmed against the user's second traceback
+(same exception, different logger module, exactly matching this
+diagnosis). Not independently re-reproduced end-to-end with a live
+`Oauth2Gateway` instance (its constructor needs real OAuth
+infrastructure that's impractical to fake, unlike `EasycontrolGateway`'s
+plain HTTP connector used for Fix 4's verification) — confidence here
+rests on tracing the actual installed source precisely (`Oauth2Gateway`
+has no `heating_circuits` override, confirmed by reading its full file)
+rather than a constructed reproduction.
+
 ## Combined branch (`working/all-fixes`)
 
 Merge order: `master` → `fix/blocking-gateway-init` → `fix/entity-has-name`
-→ `cerbrus-fork/master` → Fix 4 → Fix 5 (above). One manual conflict during
-the `cerbrus-fork/master` merge (described above), otherwise clean.
+→ `cerbrus-fork/master` → Fix 4 → Fix 5 → Fix 6 (above). One manual
+conflict during the `cerbrus-fork/master` merge (described above),
+otherwise clean.
 
 ### Version bump
 `manifest.json` version bumped `0.28.2` → `0.29.0` (commit `b9fdadd`).
