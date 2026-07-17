@@ -289,11 +289,72 @@ path (`EasyZoneCircuit`) evaluates `support_presets` cleanly; a `HC`
 circuit under `EASYCONTROL` reliably produces the same bare `BasicCircuit`
 with no `support_presets`, matching the crash exactly.
 
+### Fix 5 — OAuth tokens refreshed in memory but never persisted
+
+**Discovered:** by the same live user, after applying Fix 4 and doing a
+full restart. Their setup turned out to be a genuinely new POINTT OAuth2
+install (not a classic one Fix 4 was meant to protect) — it worked
+immediately after initial setup, then broke on the very next restart.
+**File:** [`custom_components/bosch/__init__.py`](custom_components/bosch/__init__.py), `BoschGatewayEntry`
+**Commit:** `f07cc90`
+
+**Symptom:** identical-looking failure to Fix 4's
+(`Cannot find supported device. system_info=null, productID=None`,
+logged from `bosch_thermostat_client.gateway.oauth2`), but on a device
+confirmed to have `refresh_token` correctly stored
+(`entry.data.get("refresh_token")` truthy) — so Fix 4's routing logic
+was firing correctly and this was a different failure hiding behind the
+same generic error message.
+
+**Root cause:** `bosch_thermostat_client.connectors.oauth2.Oauth2Connector`
+refreshes `access_token`/`refresh_token`/`token_expires_at` in memory via
+`_ensure_valid_token()`/`_refresh_access_token()` whenever the access
+token is expired or about to expire, and `Oauth2Gateway` exposes
+`tokens_changed()`/`get_token_info()` specifically so a host application
+can pick up and persist a refresh — its own docstrings say "tokens are
+managed by HA via entry.data". Nothing in this integration ever called
+either method: tokens were written to `entry.data` once, at initial OAuth
+setup (`config_flow.py`'s `_easycontrol_create_entry`), and never updated
+again. A refresh during a live session stays in memory only. If the OAuth
+provider rotates the refresh token on use (plausible for SingleKey ID),
+the copy in `entry.data` becomes stale the moment that happens — and on
+the next restart, `BoschGatewayEntry` loads the stale refresh_token from
+`entry.data`, the refresh attempt fails, and every authenticated request
+in `_update_info()` fails silently (caught as `DeviceException`, logged
+at debug), leaving `system_info`/`productID` empty and producing the
+exact `UnknownDevice` seen here.
+
+**Fix:** added `BoschGatewayEntry._async_persist_oauth_tokens()`, which
+calls `gateway.tokens_changed()` against what's currently stored in
+`entry.data` and, if different, writes the refreshed tokens back via
+`hass.config_entries.async_update_entry()`. Called once after initial
+connection succeeds, and again after every periodic refresh cycle
+(`thermostat_refresh`), so a rotation mid-session gets persisted before
+the next restart can lose it.
+
+**Important caveat:** this only prevents *future* recurrence. It cannot
+retroactively repair a config entry whose stored `refresh_token` has
+already gone stale — if you hit this, you need to remove and re-add the
+integration through the OAuth flow once more to get a valid token pair
+stored, after which this fix keeps it valid across restarts.
+
+**Verification status:** reasoned from source (the missing
+`tokens_changed`/`get_token_info` call sites, confirmed absent via grep
+across `custom_components/bosch`), not independently reproduced against
+a live token rotation — doing so would require a real SingleKey ID
+account and forcing a rotation, which wasn't practical here. If this
+doesn't fully resolve the "works once, breaks on restart" pattern after
+a fresh OAuth login, the next place to look is whether
+`_is_token_expired()`'s timezone-aware `datetime` comparison in
+`connectors/oauth2.py` behaves correctly with what HA persists back
+through `token_expires_at` (stored as an ISO string, reparsed with
+`datetime.fromisoformat` on load).
+
 ## Combined branch (`working/all-fixes`)
 
 Merge order: `master` → `fix/blocking-gateway-init` → `fix/entity-has-name`
-→ `cerbrus-fork/master` → Fix 4 (above). One manual conflict during the
-`cerbrus-fork/master` merge (described above), otherwise clean.
+→ `cerbrus-fork/master` → Fix 4 → Fix 5 (above). One manual conflict during
+the `cerbrus-fork/master` merge (described above), otherwise clean.
 
 ### Version bump
 `manifest.json` version bumped `0.28.2` → `0.29.0` (commit `b9fdadd`).
