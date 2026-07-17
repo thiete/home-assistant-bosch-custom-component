@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from bosch_thermostat_client.const import HVAC_HEAT, HVAC_OFF, SETPOINT
+from bosch_thermostat_client.const import HVAC_HEAT, HVAC_OFF, SETPOINT, ZN
+from bosch_thermostat_client.const.easycontrol import EASYCONTROL
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
     HVACAction,
@@ -33,15 +34,27 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     uuid = config_entry.data[UUID]
     data = hass.data[DOMAIN][uuid]
     optimistic_mode = config_entry.options.get("optimistic_mode", False)
+    gateway = data[GATEWAY]
+    # Oauth2Gateway doesn't override heating_circuits the way
+    # EasycontrolGateway does, so for EASYCONTROL it inherits
+    # BaseGateway's HC-based property instead of reading zones -- handing
+    # this platform bare BasicCircuit objects (no climate behavior at
+    # all) instead of EasyZoneCircuit. Ask for zone circuits directly for
+    # EASYCONTROL regardless of which gateway class is in play.
+    circuits = (
+        gateway.get_circuits(ZN)
+        if gateway.device_type == EASYCONTROL
+        else gateway.heating_circuits
+    )
     data[CLIMATE] = [
         BoschThermostat(
             hass=hass,
             uuid=uuid,
             bosch_object=hc,
-            gateway=data[GATEWAY],
+            gateway=gateway,
             optimistic_mode=optimistic_mode,
         )
-        for hc in data[GATEWAY].heating_circuits
+        for hc in circuits
     ]
     async_add_entities(data[CLIMATE])
     async_dispatcher_send(hass, SIGNAL_BOSCH)
