@@ -292,6 +292,7 @@ class BoschGatewayEntry:
             await self.gateway.close()
 
         if await self.async_init_bosch():
+            await self._async_persist_oauth_tokens()
             self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, close_connection)
             async_dispatcher_connect(
                 self.hass, SIGNAL_BOSCH, self.async_get_signals
@@ -380,6 +381,36 @@ class BoschGatewayEntry:
         self.hass.data[DOMAIN][self.uuid][GATEWAY] = self.gateway
         _LOGGER.info("Bosch initialized.")
         return True
+
+    async def _async_persist_oauth_tokens(self) -> None:
+        """Persist refreshed OAuth tokens back to the config entry.
+
+        Oauth2Gateway refreshes the access/refresh token in memory as
+        needed (see bosch_thermostat_client.connectors.oauth2) but never
+        writes them anywhere itself -- its own docstrings say tokens are
+        "managed by HA via entry.data". Without this, a token refresh
+        mid-session is lost on the next restart, and if the refresh token
+        itself rotates, the stale one still stored in entry.data becomes
+        unusable, breaking the integration until the user re-authenticates
+        from scratch.
+        """
+        if not hasattr(self.gateway, "tokens_changed"):
+            return
+        stored_access_token = self.config_entry.data.get(ACCESS_TOKEN)
+        stored_refresh_token = self.config_entry.data.get(REFRESH_TOKEN)
+        if not self.gateway.tokens_changed(stored_access_token, stored_refresh_token):
+            return
+        token_info = self.gateway.get_token_info()
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            data={
+                **self.config_entry.data,
+                ACCESS_TOKEN: token_info["access_token"],
+                REFRESH_TOKEN: token_info["refresh_token"],
+                TOKEN_EXPIRES_AT: token_info["token_expires_at"],
+            },
+        )
+        _LOGGER.debug("Persisted refreshed Bosch OAuth tokens to config entry.")
 
     async def recording_sensors_update(self, now=None) -> bool | None:
         """Update of 1-hour sensors.
@@ -485,6 +516,7 @@ class BoschGatewayEntry:
             await self.component_update(WATER_HEATER, event_time)
             await self.component_update(SWITCH, event_time)
             await self.component_update(NUMBER, event_time)
+            await self._async_persist_oauth_tokens()
             _LOGGER.debug("Finish updating entities. Waiting for next scheduled check.")
 
     async def firmware_refresh(self, event_time=None):
