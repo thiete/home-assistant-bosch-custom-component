@@ -80,7 +80,7 @@ UNITS_CONVERTER = {
 }
 
 NOTIFICATION_ID = "bosch_notification"
-SCAN_INTERVAL = timedelta(seconds=60)
+SCAN_INTERVAL = timedelta(seconds=20)
 FIRMWARE_SCAN_INTERVAL = timedelta(hours=4)
 SCAN_SENSOR_INTERVAL = timedelta(seconds=120)
 INTERVAL = "interval"
