@@ -186,6 +186,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
 
 async def async_update_options(hass: HomeAssistant, entry: ConfigEntry):
     """Reload entry if options change."""
+    uuid = entry.data[UUID]
+    gateway_entry = hass.data.get(DOMAIN, {}).get(uuid, {}).get(BOSCH_GATEWAY_ENTRY)
+    if gateway_entry is not None and gateway_entry._skip_next_reload:
+        gateway_entry._skip_next_reload = False
+        _LOGGER.debug(
+            "Skipping reload for entry %s -- this update was a token refresh, not an options change.",
+            entry.entry_id,
+        )
+        return
     _LOGGER.debug("Reloading entry %s", entry.entry_id)
     await hass.config_entries.async_reload(entry.entry_id)
 
@@ -231,6 +240,7 @@ class BoschGatewayEntry:
         self._signal_registered = False
         self.supported_platforms = []
         self._update_lock = None
+        self._skip_next_reload = False
 
     @property
     def device_id(self) -> str:
@@ -401,6 +411,14 @@ class BoschGatewayEntry:
         if not self.gateway.tokens_changed(stored_access_token, stored_refresh_token):
             return
         token_info = self.gateway.get_token_info()
+        # entry.add_update_listener(async_update_options) below reloads the
+        # whole integration on *any* entry update, data or options -- it
+        # can't tell a genuine options-flow change from this token refresh.
+        # Without this flag, every token refresh silently reloads the
+        # integration (closing and reconnecting the gateway), which can
+        # race with an in-flight refresh and eventually leave a stale,
+        # already-consumed refresh_token persisted.
+        self._skip_next_reload = True
         self.hass.config_entries.async_update_entry(
             self.config_entry,
             data={
