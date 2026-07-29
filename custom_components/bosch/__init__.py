@@ -585,12 +585,26 @@ class BoschGatewayEntry:
         """Reset this device to default state."""
         _LOGGER.warning("Unloading Bosch module.")
         _LOGGER.debug("Closing connection to gateway.")
-        tasks: list[Awaitable] = [
-            self.hass.config_entries.async_forward_entry_unload(
-                self.config_entry, platform
-            )
-            for platform in self.supported_platforms
-        ]
-        unload_ok = await asyncio.gather(*tasks)
-        await self.gateway.close(force=False)
-        return all(unload_ok)
+        # By the time we get here the periodic timers are already cancelled
+        # (async_unload_entry does that first), so no *new* update cycle can
+        # start -- but one may already be mid-flight. Wait for it to finish
+        # before tearing down: otherwise a reload racing against an
+        # in-flight OAuth token refresh can let this (about to be replaced)
+        # instance persist a stale token over one a fresh instance already
+        # refreshed, and some OAuth providers revoke the whole token family
+        # on refresh-token reuse.
+        if self._update_lock is not None:
+            await self._update_lock.acquire()
+        try:
+            tasks: list[Awaitable] = [
+                self.hass.config_entries.async_forward_entry_unload(
+                    self.config_entry, platform
+                )
+                for platform in self.supported_platforms
+            ]
+            unload_ok = await asyncio.gather(*tasks)
+            await self.gateway.close(force=False)
+            return all(unload_ok)
+        finally:
+            if self._update_lock is not None:
+                self._update_lock.release()
