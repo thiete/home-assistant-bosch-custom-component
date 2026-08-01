@@ -400,12 +400,113 @@ rests on tracing the actual installed source precisely (`Oauth2Gateway`
 has no `heating_circuits` override, confirmed by reading its full file)
 rather than a constructed reproduction.
 
+### Fix 7 — every OAuth token refresh silently reloaded the whole integration
+
+**Discovered:** by the same live user, after several days of otherwise
+working OAuth2 uptime — a HA restart hit the exact same "Cannot find
+supported device" error as Fix 6, but this time with `refresh_token`
+confirmed present and correct in the config entry. Something was killing
+a previously-valid token during normal operation, not at setup time.
+**File:** [`custom_components/bosch/__init__.py`](custom_components/bosch/__init__.py), `async_setup_entry`, `async_update_options`, `BoschGatewayEntry`
+**Commit:** `dedaa5d`
+
+**Root cause:** `async_setup_entry` registers
+`entry.add_update_listener(async_update_options)`
+([__init__.py:146](custom_components/bosch/__init__.py:146)), and
+`async_update_options` unconditionally calls `hass.config_entries.async_reload()`
+on *any* entry change. That listener was written for genuine options-flow
+changes (`new_stats_api`, `optimistic_mode`) — but Fix 5's
+`_async_persist_oauth_tokens()` also calls `hass.config_entries.async_update_entry()`
+to persist a refreshed token, which triggers the *same* listener.
+
+Confirmed directly against installed HA core (2026.7.4)
+`homeassistant/config_entries.py`: `_async_update_entry` sets `changed = True`
+identically whether `data` or `options` differs, and
+`_async_save_and_notify` fires every `update_listener` with no
+discrimination between them — not inferred from memory, read from the
+actual source. Since a real token refresh happens roughly hourly and
+gets persisted after every poll cycle that detects one, every single
+refresh was silently reloading the entire integration — closing the
+gateway connection and reconnecting from scratch, repeatedly, for as
+long as the entry ran. (This is also almost certainly what the earlier,
+previously-dismissed "Unloading Bosch module" warnings actually were —
+not the user's own restarts, but this bug firing on its own.)
+
+Over enough reload cycles across days of uptime, this opens a real
+corruption path: `async_reset()` (the old code) didn't wait for an
+in-flight `thermostat_refresh()` cycle before tearing down, so a reload
+could race an in-flight token refresh and let the old (about-to-be-replaced)
+instance persist a stale token over one a fresh instance had already
+saved. If SingleKey ID enforces refresh-token reuse detection (plausible —
+its `/auth/connect/token` endpoint pattern is a standard
+IdentityServer/Duende convention, and that stack commonly revokes the
+whole token family on reuse), that turns a transient race into a
+permanent, unrecoverable failure — matching the *identical* failure on
+every ~10-minute `ConfigEntryNotReady` retry the user observed, rather
+than intermittent success.
+
+**Fix:** a `_skip_next_reload` flag on `BoschGatewayEntry`, set right
+before `_async_persist_oauth_tokens()` calls `async_update_entry()` and
+consumed once by `async_update_options`, which reloads normally for any
+other (genuine) entry change.
+
+**Verification status:** the listener-fires-on-any-change mechanism is
+confirmed against real installed HA core source, not memory. That this
+specific mechanism caused *this specific* user's 11-day failure is a
+well-evidenced but not directly proven theory — no log evidence of the
+reload actually firing repeatedly was available (would need
+`homeassistant.config_entries` at debug level over the full 11 days).
+Ruled out as an alternative explanation: an unclean shutdown losing the
+~1s debounced storage write (`SAVE_DELAY = 1` in HA core, confirmed via
+source) — the user confirmed their restart was a clean UI-triggered one,
+and HA flushes pending writes on `EVENT_HOMEASSISTANT_FINAL_WRITE` during
+a clean shutdown.
+
+### Fix 8 — teardown didn't wait for an in-flight update cycle
+
+**File:** [`custom_components/bosch/__init__.py`](custom_components/bosch/__init__.py), `BoschGatewayEntry.async_reset`
+**Commit:** `9b96b4b`
+
+Defense-in-depth alongside Fix 7: `_skip_next_reload` closes off the
+highest-frequency reload trigger (routine token refreshes), but a
+genuine options-flow change, a manual "Reload" click, or any other
+HA-initiated reload still triggers a real one — and the same
+teardown-during-in-flight-refresh race Fix 7 identified was still
+possible for those, just far less frequently.
+
+`async_reset()` now `await`s `self._update_lock.acquire()` before
+tearing down (platforms unload, gateway closes), releasing it in a
+`finally`. By the time `async_reset()` runs, `async_unload_entry` has
+already cancelled the periodic timers, so no *new* update cycle can
+start — this only waits for one already in flight to finish. No deadlock
+risk: `async_reset()` is only ever invoked from HA's own unload
+machinery, never from a path that already holds `_update_lock` itself.
+
+### scripts/refresh_bosch_oauth.py — recovering without losing entity names
+
+This integration has no `async_step_reauth`/`ConfigEntryAuthFailed`
+support (checked: neither exists in `config_flow.py`), so there's no
+built-in "reauthenticate" flow that preserves the config entry. The only
+UI-driven way to redo OAuth is remove-and-re-add, which deletes the
+entity registry rows (names, custom entity_ids, areas, history) along
+with the entry — re-adding only recovers the *default* computed names,
+since `unique_id`s are derived from the device itself, not the entry_id.
+
+[`scripts/refresh_bosch_oauth.py`](scripts/refresh_bosch_oauth.py) (see
+[`scripts/README.md`](scripts/README.md) for full usage) redoes just the
+OAuth login and patches the three token fields directly into the
+*existing* entry's stored data, leaving the entry_id and every entity
+registry row untouched. Useful any time Fix 7/8 don't prevent a token
+from going stale for a reason outside this integration's control (e.g.
+a SingleKey ID-side session policy) — gets you back to working without
+losing anything, in place of a full remove/re-add.
+
 ## Combined branch (`working/all-fixes`)
 
 Merge order: `master` → `fix/blocking-gateway-init` → `fix/entity-has-name`
-→ `cerbrus-fork/master` → Fix 4 → Fix 5 → Fix 6 (above). One manual
-conflict during the `cerbrus-fork/master` merge (described above),
-otherwise clean.
+→ `cerbrus-fork/master` → Fix 4 → Fix 5 → Fix 6 → Fix 7 → Fix 8 (above).
+One manual conflict during the `cerbrus-fork/master` merge (described
+above), otherwise clean.
 
 ### Version bump
 `manifest.json` version bumped `0.28.2` → `0.29.0` (commit `b9fdadd`).
