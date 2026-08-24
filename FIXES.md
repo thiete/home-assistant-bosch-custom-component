@@ -234,9 +234,30 @@ desktop browsers can't follow it on their own. Cerbrus's `oauth-helper/`
 (Windows-only, registers the scheme via the Windows Registry) fills that
 role; a macOS port was attempted but the direct-executable-in-a-.app-bundle
 approach was blocked by Gatekeeper (`spctl` rejects an unsigned bundle even
-after ad-hoc `codesign --sign -`) and was not completed. This is entirely
-outside the HA integration's code — it only matters during initial
-EasyControl device setup, not for ongoing operation.
+after ad-hoc `codesign --sign -`) and was not completed at the time. This
+is entirely outside the HA integration's code — it only matters during
+initial EasyControl device setup, not for ongoing operation.
+
+**Resolved cross-platform (2026-08-24):**
+[`scripts/capture_oauth_redirect_playwright.py`](scripts/capture_oauth_redirect_playwright.py)
+(pulled from
+[JoniVR/home-assistant-bosch-custom-component](https://github.com/JoniVR/home-assistant-bosch-custom-component)'s
+`scripts/pointt_oauth_playwright.py`) sidesteps the whole OS-registration
+problem the macOS port got stuck on. Instead of getting the *operating
+system* to hand off the custom-scheme redirect to a registered handler, it
+drives a real Chromium browser via Playwright and listens on the browser's
+*own* event stream (`page.on("response")`'s `Location` header, and
+`page.on("request")` for the navigation attempt itself) — neither depends
+on the OS successfully opening the URL, so there's no app bundle to sign
+and nothing to register with Gatekeeper or the Windows Registry. Verified
+working end-to-end up to the human-login step: it launches Chromium,
+reaches the real Bosch SingleKey ID login page, and sets up capture
+correctly (confirmed via a deliberately short `--timeout` producing the
+correct graceful failure path) — the actual redirect capture on a
+completed login wasn't independently re-verified here, since that needs a
+real account login. See [`scripts/README.md`](scripts/README.md) for
+usage; the Windows VM route still works as a fallback if this ever breaks
+(e.g. the login page's bot detection catching up with `playwright-stealth`).
 
 ### Fix 4 — Oauth2Gateway wrongly used for classic local EasyControl entries
 
@@ -482,15 +503,66 @@ start — this only waits for one already in flight to finish. No deadlock
 risk: `async_reset()` is only ever invoked from HA's own unload
 machinery, never from a path that already holds `_update_lock` itself.
 
+### Fix 9 — redoing OAuth login now updates the existing entry, not just aborts
+
+**Discovered by comparing against an independent fork:**
+[FoxyHunter7/home-assistant-bosch-custom-component](https://github.com/FoxyHunter7/home-assistant-bosch-custom-component)'s
+`fix/oauth-token-persistence` branch — same starting point as us
+(Cerbrus's `480764f`), and it arrived at a diagnosis close enough to
+Fix 5/7 to be worth a full comparison (see that fork's own commits
+`cfd6e46`/`6bbd6bb`/`60fcc16`). Two of its three commits were either
+equivalent to what we'd already built or had a latent bug not worth
+copying as-is (its persist gate reads
+`self.gateway.refresh_token`/`.token_expires_at` unconditionally for any
+`EASYCONTROL` device — those only exist on `Oauth2Gateway`, and that
+fork never fixed the Fix-4-equivalent misrouting bug, so `device_type ==
+EASYCONTROL` doesn't reliably mean `Oauth2Gateway` on *this* branch). The
+third was genuinely worth pulling in.
+**Files:** [`custom_components/bosch/config_flow.py`](custom_components/bosch/config_flow.py) (`_easycontrol_create_entry`), [`custom_components/bosch/__init__.py`](custom_components/bosch/__init__.py) (`async_init_bosch`)
+**Commit:** `b078f9c`
+
+**config_flow.py:** `_easycontrol_create_entry()` previously called bare
+`self._abort_if_unique_id_configured()` when the device's UUID matched an
+entry that already exists — just aborting, forcing a full remove-and-re-add
+to recover from a dead `refresh_token` (see the section right below on
+why that's costly). `_abort_if_unique_id_configured` accepts an `updates=`
+dict: when the unique_id matches, it writes those fields into the
+*existing* entry before aborting, instead of only aborting. Passing the
+freshly obtained `access_token`/`refresh_token`/`token_expires_at` there
+means redoing the OAuth login through the normal "Add Integration" flow
+now refreshes an already-configured device's credentials in place —
+functionally a reauth flow, without implementing a formal
+`async_step_reauth`.
+
+**__init__.py:** `async_init_bosch()` now persists tokens from a `finally`
+wrapping its entire body (previously: only after the whole method returned
+successfully). A token can refresh mid-attempt, during
+`check_connection()`/`get_capabilities()`, and then have the rest of the
+attempt fail for an unrelated reason — that refreshed token was being
+silently lost since persistence only ran on the success path. Removed the
+now-redundant persist call in `async_init()`'s success branch, since the
+`finally` inside `async_init_bosch()` covers every exit path already.
+
+**Verification status:** both changes compile and were reviewed against
+the actual control flow (confirmed every `return`/`raise` path in
+`async_init_bosch()` is now covered by the `finally`), but not exercised
+against a live token refresh mid-failure or a live re-auth through the UI
+— those need a real device and a real expired token to trigger naturally.
+
 ### scripts/refresh_bosch_oauth.py — recovering without losing entity names
 
-This integration has no `async_step_reauth`/`ConfigEntryAuthFailed`
-support (checked: neither exists in `config_flow.py`), so there's no
-built-in "reauthenticate" flow that preserves the config entry. The only
-UI-driven way to redo OAuth is remove-and-re-add, which deletes the
-entity registry rows (names, custom entity_ids, areas, history) along
-with the entry — re-adding only recovers the *default* computed names,
-since `unique_id`s are derived from the device itself, not the entry_id.
+This integration has no formal `async_step_reauth`/`ConfigEntryAuthFailed`
+support (checked: neither exists in `config_flow.py`). Fix 9 above gets
+most of the way there for the specific EasyControl OAuth case — redoing
+the login through "Add Integration" now updates an existing entry rather
+than just erroring out — but there's still no reauth entry point reachable
+from a failed entry's own UI (the "Reauthenticate" button HA shows
+automatically for `ConfigEntryAuthFailed`), and no equivalent at all for
+non-EasyControl device types. Absent that, the only fully UI-driven way to
+redo credentials is remove-and-re-add, which deletes the entity registry
+rows (names, custom entity_ids, areas, history) along with the entry —
+re-adding only recovers the *default* computed names, since `unique_id`s
+are derived from the device itself, not the entry_id.
 
 [`scripts/refresh_bosch_oauth.py`](scripts/refresh_bosch_oauth.py) (see
 [`scripts/README.md`](scripts/README.md) for full usage) redoes just the
