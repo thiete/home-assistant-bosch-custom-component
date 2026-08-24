@@ -249,15 +249,17 @@ drives a real Chromium browser via Playwright and listens on the browser's
 *own* event stream (`page.on("response")`'s `Location` header, and
 `page.on("request")` for the navigation attempt itself) — neither depends
 on the OS successfully opening the URL, so there's no app bundle to sign
-and nothing to register with Gatekeeper or the Windows Registry. Verified
-working end-to-end up to the human-login step: it launches Chromium,
-reaches the real Bosch SingleKey ID login page, and sets up capture
-correctly (confirmed via a deliberately short `--timeout` producing the
-correct graceful failure path) — the actual redirect capture on a
-completed login wasn't independently re-verified here, since that needs a
-real account login. See [`scripts/README.md`](scripts/README.md) for
-usage; the Windows VM route still works as a fallback if this ever breaks
-(e.g. the login page's bot detection catching up with `playwright-stealth`).
+and nothing to register with Gatekeeper or the Windows Registry.
+
+**Verification status:** confirmed working fully end-to-end, including the
+actual human-login step — the user completed a real SingleKey ID login on
+macOS and the script captured the redirect correctly. (Before that: the
+launch/navigate/graceful-timeout path was confirmed here via a
+deliberately short `--timeout`, but the capture-on-successful-login path
+specifically needed a real account and could only be checked by the user.)
+See [`scripts/README.md`](scripts/README.md) for usage; the Windows VM
+route still works as a fallback if this ever breaks (e.g. the login
+page's bot detection catching up with `playwright-stealth`).
 
 ### Fix 4 — Oauth2Gateway wrongly used for classic local EasyControl entries
 
