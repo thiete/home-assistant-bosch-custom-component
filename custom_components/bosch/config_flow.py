@@ -328,7 +328,22 @@ class BoschFlowHandler(config_entries.ConfigFlow):
 
         if uuid:
             await self.async_set_unique_id(str(uuid))
-            self._abort_if_unique_id_configured()
+            # If this device is already configured -- most commonly because
+            # the stored refresh_token went stale and the user is redoing
+            # the OAuth login to recover -- update the existing entry's
+            # credentials in place instead of just aborting. Preserves the
+            # entry_id and every entity registry row (names, areas, custom
+            # entity_ids, history) rather than requiring a full remove and
+            # re-add through the config flow.
+            self._abort_if_unique_id_configured(
+                updates={
+                    ACCESS_TOKEN: access_token,
+                    REFRESH_TOKEN: refresh_token,
+                    TOKEN_EXPIRES_AT: (
+                        token_expires_at.isoformat() if token_expires_at else None
+                    ),
+                }
+            )
 
         return self.async_create_entry(
             title=gateway.device_name or "Bosch EasyControl",

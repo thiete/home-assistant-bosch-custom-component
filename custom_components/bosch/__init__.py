@@ -302,7 +302,9 @@ class BoschGatewayEntry:
             await self.gateway.close()
 
         if await self.async_init_bosch():
-            await self._async_persist_oauth_tokens()
+            # (token persistence now happens unconditionally inside
+            # async_init_bosch()'s own finally block, covering failure
+            # paths too -- no separate call needed here on success)
             self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, close_connection)
             async_dispatcher_connect(
                 self.hass, SIGNAL_BOSCH, self.async_get_signals
@@ -355,40 +357,49 @@ class BoschGatewayEntry:
         """Initialize Bosch gateway module."""
         _LOGGER.debug("Checking connection to Bosch gateway as %s.", self._host)
         try:
-            await self.gateway.check_connection()
-        except (FirmwareException) as err:
-            create_notification_firmware(hass=self.hass, msg=err)
-            _LOGGER.error(err)
-            return False
-        except (UnknownDevice, EncryptionException) as err:
-            _LOGGER.error(err)
-            _LOGGER.error("You might need to check your password.")
-            raise ConfigEntryNotReady(
-                "Cannot connect to Bosch gateway, host %s with UUID: %s",
-                self._host,
-                self.uuid,
-            )
-        if not self.gateway.uuid:
-            raise ConfigEntryNotReady(
-                "Cannot connect to Bosch gateway, host %s with UUID: %s",
-                self._host,
-                self.uuid,
-            )
-        _LOGGER.debug("Bosch BUS detected: %s", self.gateway.bus_type)
-        if not self.gateway.database:
-            custom_db = load_json(self.hass.config.path(CUSTOM_DB), default=None)
-            if custom_db:
-                _LOGGER.info("Loading custom db file.")
-                await self.gateway.custom_initialize(custom_db)
-        if self.gateway.database:
-            supported_bosch = await self.gateway.get_capabilities()
-            _LOGGER.debug(f"Bosch supported capabilities: {supported_bosch}")
-            for supported in supported_bosch:
-                elements = SUPPORTED_PLATFORMS[supported]
-                for element in elements:
-                    if element not in self.supported_platforms:
-                        self.supported_platforms.append(element)
-        self.hass.data[DOMAIN][self.uuid][GATEWAY] = self.gateway
+            try:
+                await self.gateway.check_connection()
+            except (FirmwareException) as err:
+                create_notification_firmware(hass=self.hass, msg=err)
+                _LOGGER.error(err)
+                return False
+            except (UnknownDevice, EncryptionException) as err:
+                _LOGGER.error(err)
+                _LOGGER.error("You might need to check your password.")
+                raise ConfigEntryNotReady(
+                    "Cannot connect to Bosch gateway, host %s with UUID: %s",
+                    self._host,
+                    self.uuid,
+                )
+            if not self.gateway.uuid:
+                raise ConfigEntryNotReady(
+                    "Cannot connect to Bosch gateway, host %s with UUID: %s",
+                    self._host,
+                    self.uuid,
+                )
+            _LOGGER.debug("Bosch BUS detected: %s", self.gateway.bus_type)
+            if not self.gateway.database:
+                custom_db = load_json(self.hass.config.path(CUSTOM_DB), default=None)
+                if custom_db:
+                    _LOGGER.info("Loading custom db file.")
+                    await self.gateway.custom_initialize(custom_db)
+            if self.gateway.database:
+                supported_bosch = await self.gateway.get_capabilities()
+                _LOGGER.debug(f"Bosch supported capabilities: {supported_bosch}")
+                for supported in supported_bosch:
+                    elements = SUPPORTED_PLATFORMS[supported]
+                    for element in elements:
+                        if element not in self.supported_platforms:
+                            self.supported_platforms.append(element)
+            self.hass.data[DOMAIN][self.uuid][GATEWAY] = self.gateway
+        finally:
+            # Persist any OAuth token refresh that happened during
+            # check_connection()/get_capabilities() even if this attempt
+            # ultimately fails or raises -- a token refreshed mid-attempt
+            # must not be lost just because the rest of setup didn't
+            # complete. No-ops for non-OAuth2 gateways (guarded internally
+            # by _async_persist_oauth_tokens).
+            await self._async_persist_oauth_tokens()
         _LOGGER.info("Bosch initialized.")
         return True
 
